@@ -61,6 +61,7 @@ interface PollOption {
   id: string;
   poll_id: string | number;
   option_text?: string;
+  label?: string;
   value?: string;
   type?: string;
   votes_count?: number;
@@ -331,22 +332,49 @@ function PollContent({ params }: PollPageProps) {
   // Phase 2: Add WhatsApp-style combined Date & Time Option
   const handleAddCombinedOption = async (e: React.FormEvent) => {
     e.preventDefault();
-    const trimmedOption = newCombinedOption.trim();
-    if (!trimmedOption) return;
+    const optionValue = newCombinedOption.trim();
+    if (!optionValue) return;
 
     setAddingOption(true);
     try {
-      // Store in both option_text and value so queries work on either schema version
-      const { error } = await supabase.from('poll_options').insert([
-        {
+      // Send both 'option_text' and 'label' with the same string value
+      const { error } = await supabase.from('poll_options').insert({
+        poll_id: pollId,
+        option_text: optionValue,
+        label: optionValue,
+      });
+
+      if (error) {
+        // Fallback for schemas with strict column checks (e.g. if 'label' or 'option_text' alone is allowed)
+        console.warn('Initial insert attempt error:', error.message);
+        const fallback1 = await supabase.from('poll_options').insert({
           poll_id: pollId,
-          option_text: trimmedOption,
-          value: trimmedOption,
-          type: 'combined',
-        },
-      ]);
-      if (error) throw error;
+          option_text: optionValue,
+        });
+        if (fallback1.error) {
+          const fallback2 = await supabase.from('poll_options').insert({
+            poll_id: pollId,
+            label: optionValue,
+          });
+          if (fallback2.error) {
+            throw fallback2.error;
+          }
+        }
+      }
+
       setNewCombinedOption('');
+
+      // Immediately re-fetch the options list and poll data so UI updates instantly
+      const { data: optData } = await supabase
+        .from('poll_options')
+        .select('*')
+        .eq('poll_id', pollId)
+        .order('created_at', { ascending: true });
+
+      if (optData) {
+        setOptions(optData);
+      }
+
       await fetchPollData();
     } catch (err: any) {
       console.error('Error adding option:', err);
@@ -585,8 +613,8 @@ function PollContent({ params }: PollPageProps) {
   const comingList = votes.filter((v) => v.coming);
   const notComingList = votes.filter((v) => !v.coming);
 
-  // Helper to extract option text whether stored in 'option_text' or 'value'
-  const getOptionLabel = (opt: PollOption) => opt.option_text || opt.value || 'Untitled Option';
+  // Helper to extract option text whether stored in 'option_text', 'label', or 'value'
+  const getOptionLabel = (opt: PollOption) => opt.option_text || opt.label || opt.value || 'Untitled Option';
 
   // Count helper
   const getVotesForOption = (optionId: string) => {
