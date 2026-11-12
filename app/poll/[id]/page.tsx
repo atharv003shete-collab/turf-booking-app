@@ -30,6 +30,9 @@ import {
   QrCode,
   Sparkles,
   Award,
+  AlertTriangle,
+  Receipt,
+  FileCheck,
 } from 'lucide-react';
 
 interface Poll {
@@ -70,6 +73,23 @@ interface OptionVote {
   voter_name: string;
 }
 
+interface PaymentRecord {
+  id: string;
+  poll_id: string | number;
+  player_name: string;
+  amount_paid: number;
+  expected_amount: number;
+  screenshot_url: string;
+  transaction_id?: string;
+  receiver_name_or_upi?: string;
+  gemini_verdict: 'valid' | 'suspicious' | 'invalid';
+  final_status: 'valid' | 'invalid' | 'pending';
+  reasons: string[];
+  is_manual_override: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
 interface PollPageProps {
   params: Promise<{ id: string }>;
 }
@@ -84,10 +104,11 @@ function PollContent({ params }: PollPageProps) {
   const [votes, setVotes] = useState<Vote[]>([]);
   const [options, setOptions] = useState<PollOption[]>([]);
   const [optionVotes, setOptionVotes] = useState<OptionVote[]>([]);
+  const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // User state
+  // User identity & role state
   const [voterName, setVoterName] = useState('');
   const [isHost, setIsHost] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -103,7 +124,7 @@ function PollContent({ params }: PollPageProps) {
   const [optionActionId, setOptionActionId] = useState<string | null>(null);
   const [advancingPhase, setAdvancingPhase] = useState(false);
 
-  // Finalisation form state
+  // Finalisation form state (Phase 2 -> Finalised)
   const [finalDate, setFinalDate] = useState('');
   const [finalTime, setFinalTime] = useState('');
   const [totalCost, setTotalCost] = useState('');
@@ -111,6 +132,19 @@ function PollContent({ params }: PollPageProps) {
   const [qrFile, setQrFile] = useState<File | null>(null);
   const [isFinalising, setIsFinalising] = useState(false);
   const [finaliseError, setFinaliseError] = useState<string | null>(null);
+
+  // Phase 3: Player Payment Screenshot Upload State
+  const [paymentScreenshotFile, setPaymentScreenshotFile] = useState<File | null>(null);
+  const [isUploadingPayment, setIsUploadingPayment] = useState(false);
+  const [paymentUploadMsg, setPaymentUploadMsg] = useState<{
+    type: 'success' | 'error' | 'warning';
+    text: string;
+    details?: any;
+  } | null>(null);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  // Host manual override action loading state
+  const [overrideLoadingId, setOverrideLoadingId] = useState<string | null>(null);
 
   // Load voter name & host authorization check
   useEffect(() => {
@@ -125,7 +159,7 @@ function PollContent({ params }: PollPageProps) {
     }
   }, [pollId, isHostQuery]);
 
-  // Fetch all poll data
+  // Fetch all poll data, votes, options, payments
   const fetchPollData = async () => {
     try {
       // 1. Fetch Poll
@@ -183,6 +217,18 @@ function PollContent({ params }: PollPageProps) {
         console.warn('Option votes fetch error:', optVoteError);
       }
       setOptionVotes(optVoteData || []);
+
+      // 5. Fetch Payments (Phase 3)
+      const { data: paymentData, error: paymentError } = await supabase
+        .from('payments')
+        .select('*')
+        .eq('poll_id', pollId)
+        .order('created_at', { ascending: false });
+
+      if (paymentError && paymentError.code !== '42P01') {
+        console.warn('Payments fetch error:', paymentError);
+      }
+      setPayments(paymentData || []);
     } catch (err: any) {
       console.error('Error fetching poll data:', err);
       setErrorMsg(err.message || 'Could not load poll details.');
@@ -207,6 +253,9 @@ function PollContent({ params }: PollPageProps) {
         fetchPollData();
       })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'option_votes', filter: `poll_id=eq.${pollId}` }, () => {
+        fetchPollData();
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'payments', filter: `poll_id=eq.${pollId}` }, () => {
         fetchPollData();
       })
       .subscribe();
@@ -343,16 +392,13 @@ function PollContent({ params }: PollPageProps) {
         localStorage.setItem('turf_voter_name', trimmedName);
       }
 
-      // Check if user already voted on this option
       const existing = optionVotes.find(
         (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === trimmedName.toLowerCase()
       );
 
       if (existing) {
-        // Toggle OFF vote
         await supabase.from('option_votes').delete().eq('id', existing.id);
       } else {
-        // Toggle ON vote
         await supabase.from('option_votes').insert([
           {
             option_id: optionId,
@@ -384,7 +430,6 @@ function PollContent({ params }: PollPageProps) {
     try {
       let uploadedQrUrl: string | undefined = undefined;
 
-      // Optional QR upload to 'screenshots' bucket
       if (qrFile) {
         const fileExt = qrFile.name.split('.').pop() || 'png';
         const fileName = `qr_${pollId}_${Date.now()}.${fileExt}`;
@@ -425,6 +470,128 @@ function PollContent({ params }: PollPageProps) {
     }
   };
 
+  // =========================================================================
+  // Phase 3: Player Payment Screenshot Upload & Gemini API Verification
+  // =========================================================================
+  const handleUploadPaymentScreenshot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmedName = voterName.trim();
+    if (!trimmedName) {
+      setPaymentUploadMsg({ type: 'error', text: 'Please enter your player name first.' });
+      return;
+    }
+
+    if (!paymentScreenshotFile) {
+      setPaymentUploadMsg({ type: 'error', text: 'Please choose a payment screenshot to upload.' });
+      return;
+    }
+
+    setIsUploadingPayment(true);
+    setPaymentUploadMsg(null);
+
+    try {
+      // 1. Upload screenshot to Supabase 'screenshots' storage bucket
+      const fileExt = paymentScreenshotFile.name.split('.').pop() || 'png';
+      const cleanPlayerName = trimmedName.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
+      const fileName = `payment_${pollId}_${cleanPlayerName}_${Date.now()}.${fileExt}`;
+
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from('screenshots')
+        .upload(fileName, paymentScreenshotFile, {
+          cacheControl: '3600',
+          upsert: true,
+        });
+
+      if (uploadError) {
+        throw new Error('Supabase Storage upload failed: ' + uploadError.message);
+      }
+
+      // Get public URL of the uploaded screenshot
+      const { data: publicUrlData } = supabase.storage
+        .from('screenshots')
+        .getPublicUrl(fileName);
+
+      const screenshotPublicUrl = publicUrlData.publicUrl;
+
+      // 2. Call secure server-side Gemini verification API route
+      const res = await fetch('/api/verify-payment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          poll_id: pollId,
+          player_name: trimmedName,
+          screenshot_url: screenshotPublicUrl,
+          expected_amount: costPerPerson,
+          host_payment_info: poll?.payment_info || '',
+          host_name: poll?.host_name || '',
+        }),
+      });
+
+      const result = await res.json();
+
+      if (!res.ok) {
+        throw new Error(result.error || 'Server error while verifying screenshot.');
+      }
+
+      const verdict = result.verdict || result.payment?.gemini_verdict;
+      if (verdict === 'valid') {
+        setPaymentUploadMsg({
+          type: 'success',
+          text: 'Payment Verified! Gemini confirmed your payment details.',
+          details: result.payment,
+        });
+      } else if (verdict === 'suspicious') {
+        setPaymentUploadMsg({
+          type: 'warning',
+          text: 'Payment Flagged for Host Review: Gemini detected discrepancies or unconfirmed details.',
+          details: result.payment,
+        });
+      } else {
+        setPaymentUploadMsg({
+          type: 'error',
+          text: 'Payment Flagged as Invalid by Gemini. Please check the reasons below or verify with the host.',
+          details: result.payment,
+        });
+      }
+
+      // Reset file input
+      setPaymentScreenshotFile(null);
+      setPreviewUrl(null);
+      await fetchPollData();
+    } catch (err: any) {
+      console.error('Payment upload error:', err);
+      setPaymentUploadMsg({
+        type: 'error',
+        text: err.message || 'Failed to process screenshot.',
+      });
+    } finally {
+      setIsUploadingPayment(false);
+    }
+  };
+
+  // Host Manual Override: Change final_status to 'valid' or 'invalid'
+  const handleHostManualOverride = async (paymentId: string, newStatus: 'valid' | 'invalid') => {
+    setOverrideLoadingId(paymentId);
+    try {
+      const { error } = await supabase
+        .from('payments')
+        .update({
+          final_status: newStatus,
+          is_manual_override: true,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', paymentId);
+
+      if (error) throw error;
+      await fetchPollData();
+    } catch (err: any) {
+      console.error('Host override error:', err);
+      alert('Failed to override status: ' + err.message);
+    } finally {
+      setOverrideLoadingId(null);
+    }
+  };
+
   const copyShareLink = async () => {
     if (typeof window === 'undefined') return;
     const shareUrl = `${window.location.origin}/poll/${pollId}`;
@@ -445,7 +612,7 @@ function PollContent({ params }: PollPageProps) {
   const dateOptions = options.filter((o) => o.type === 'date');
   const timeOptions = options.filter((o) => o.type === 'time');
 
-  // Count helper
+  // Count helpers
   const getVotesForOption = (optionId: string) => {
     return optionVotes.filter((ov) => ov.option_id === optionId);
   };
@@ -458,6 +625,11 @@ function PollContent({ params }: PollPageProps) {
   // Cost split calculation for finalised view
   const confirmedPlayersCount = comingList.length > 0 ? comingList.length : 1;
   const costPerPerson = poll?.total_cost ? Math.ceil(poll.total_cost / confirmedPlayersCount) : 0;
+
+  // Player's existing payment record if any
+  const currentPlayerPayment = payments.find(
+    (p) => p.player_name.toLowerCase() === voterName.trim().toLowerCase()
+  );
 
   if (loading) {
     return (
@@ -489,7 +661,7 @@ function PollContent({ params }: PollPageProps) {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-emerald-950 via-slate-900 to-zinc-950 text-zinc-100 p-4 sm:p-8">
-      <div className="max-w-3xl mx-auto space-y-6 pb-16">
+      <div className="max-w-4xl mx-auto space-y-6 pb-20">
         {/* Top Navbar */}
         <div className="flex items-center justify-between gap-4">
           <Link
@@ -559,7 +731,6 @@ function PollContent({ params }: PollPageProps) {
               <span>Host: <strong className="text-zinc-100">{poll.host_name}</strong></span>
             </div>
 
-            {/* Pre-seeded Turf Quick Action Buttons */}
             {turfInfo && (
               <div className="flex items-center gap-2">
                 <a
@@ -587,7 +758,7 @@ function PollContent({ params }: PollPageProps) {
         <div className="bg-zinc-900/60 border border-zinc-800/80 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm">
           <div className="flex items-center gap-2 text-zinc-300">
             <User className="w-4 h-4 text-emerald-400" />
-            <span>Voting as:</span>
+            <span>Viewing as Player:</span>
             <input
               type="text"
               value={voterName}
@@ -601,7 +772,7 @@ function PollContent({ params }: PollPageProps) {
               className="bg-zinc-950 border border-zinc-700 rounded-lg px-2.5 py-1 text-white text-xs outline-none focus:border-emerald-400 font-medium"
             />
           </div>
-          <span className="text-zinc-500 text-xs">Used for your attendance & slot votes</span>
+          <span className="text-zinc-500 text-xs">Used for attendance, voting & payment verification</span>
         </div>
 
         {/* ========================================================================= */}
@@ -649,13 +820,13 @@ function PollContent({ params }: PollPageProps) {
             </div>
           )}
 
-          {/* Voting Action Buttons */}
+          {/* Voting Action Buttons (Disabled in finalised) */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <button
               type="button"
-              disabled={voteSubmitting}
+              disabled={voteSubmitting || poll.status === 'finalised'}
               onClick={() => handleVote(true)}
-              className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.99] text-white font-semibold text-sm transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed shadow-lg shadow-emerald-900/30"
+              className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.99] text-white font-semibold text-sm transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-emerald-900/30"
             >
               <CheckCircle2 className="w-4 h-4" />
               Yes, I&apos;m in!
@@ -663,9 +834,9 @@ function PollContent({ params }: PollPageProps) {
 
             <button
               type="button"
-              disabled={voteSubmitting}
+              disabled={voteSubmitting || poll.status === 'finalised'}
               onClick={() => handleVote(false)}
-              className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-zinc-800 hover:bg-rose-950/80 hover:text-rose-200 hover:border-rose-500/40 border border-zinc-700 text-zinc-300 active:scale-[0.99] font-semibold text-sm transition cursor-pointer disabled:opacity-60 disabled:cursor-not-allowed"
+              className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-zinc-800 hover:bg-rose-950/80 hover:text-rose-200 hover:border-rose-500/40 border border-zinc-700 text-zinc-300 active:scale-[0.99] font-semibold text-sm transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <XCircle className="w-4 h-4" />
               Not coming
@@ -725,7 +896,7 @@ function PollContent({ params }: PollPageProps) {
         </div>
 
         {/* ========================================================================= */}
-        {/* PHASE 2: Date & Time Voting (Available in 'poll_2' or 'finalised') */}
+        {/* PHASE 2: Date & Time Voting */}
         {/* ========================================================================= */}
         {(poll.status === 'poll_2' || poll.status === 'finalised') && (
           <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-8">
@@ -746,14 +917,13 @@ function PollContent({ params }: PollPageProps) {
               )}
             </div>
 
-            {/* SECTION A: Dates */}
+            {/* Dates */}
             <div className="space-y-4">
               <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
                 <Calendar className="w-4 h-4" />
                 Date Options
               </h3>
 
-              {/* Add Date Form */}
               {poll.status !== 'finalised' && (
                 <form onSubmit={handleAddDateOption} className="flex gap-2">
                   <input
@@ -774,7 +944,6 @@ function PollContent({ params }: PollPageProps) {
                 </form>
               )}
 
-              {/* Dates list */}
               {dateOptions.length === 0 ? (
                 <p className="text-zinc-600 text-xs italic">No date options proposed yet.</p>
               ) : (
@@ -821,14 +990,13 @@ function PollContent({ params }: PollPageProps) {
               )}
             </div>
 
-            {/* SECTION B: Times */}
+            {/* Times */}
             <div className="space-y-4 pt-4 border-t border-zinc-800">
               <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
                 <Clock className="w-4 h-4" />
                 Time Slot Options
               </h3>
 
-              {/* Add Time Form */}
               {poll.status !== 'finalised' && (
                 <form onSubmit={handleAddTimeOption} className="flex gap-2">
                   <input
@@ -849,7 +1017,6 @@ function PollContent({ params }: PollPageProps) {
                 </form>
               )}
 
-              {/* Times list */}
               {timeOptions.length === 0 ? (
                 <p className="text-zinc-600 text-xs italic">No time slot options proposed yet.</p>
               ) : (
@@ -899,7 +1066,7 @@ function PollContent({ params }: PollPageProps) {
         )}
 
         {/* ========================================================================= */}
-        {/* HOST FINALISATION & VENUE BOOKING HUB (Host Only in Phase 2) */}
+        {/* HOST FINALISATION (Phase 2 -> Finalised) */}
         {/* ========================================================================= */}
         {poll.status === 'poll_2' && isHost && (
           <div className="bg-gradient-to-br from-emerald-950/70 via-zinc-900 to-zinc-950 border border-emerald-500/40 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-6">
@@ -915,7 +1082,6 @@ function PollContent({ params }: PollPageProps) {
               </div>
             </div>
 
-            {/* Venue Calling Banner */}
             {turfInfo && (
               <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-3">
@@ -956,10 +1122,8 @@ function PollContent({ params }: PollPageProps) {
               </div>
             )}
 
-            {/* Finalisation Form */}
             <form onSubmit={handleFinalisePoll} className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                {/* Final Date */}
                 <div>
                   <label htmlFor="finalDate" className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
                     <Calendar className="w-3.5 h-3.5 text-emerald-400" />
@@ -991,7 +1155,6 @@ function PollContent({ params }: PollPageProps) {
                   )}
                 </div>
 
-                {/* Final Time */}
                 <div>
                   <label htmlFor="finalTime" className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
                     <Clock className="w-3.5 h-3.5 text-emerald-400" />
@@ -1025,7 +1188,6 @@ function PollContent({ params }: PollPageProps) {
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                {/* Total Turf Cost */}
                 <div>
                   <label htmlFor="totalCost" className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
                     <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
@@ -1049,7 +1211,6 @@ function PollContent({ params }: PollPageProps) {
                   )}
                 </div>
 
-                {/* Host Payment Info / UPI ID */}
                 <div>
                   <label htmlFor="paymentInfo" className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
                     <QrCode className="w-3.5 h-3.5 text-emerald-400" />
@@ -1066,7 +1227,6 @@ function PollContent({ params }: PollPageProps) {
                 </div>
               </div>
 
-              {/* Upload QR Image (Optional) */}
               <div className="pt-2">
                 <label className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
                   <Upload className="w-3.5 h-3.5 text-emerald-400" />
@@ -1084,7 +1244,6 @@ function PollContent({ params }: PollPageProps) {
                 />
               </div>
 
-              {/* Submit Finalise Button */}
               <button
                 type="submit"
                 disabled={isFinalising}
@@ -1107,95 +1266,424 @@ function PollContent({ params }: PollPageProps) {
         )}
 
         {/* ========================================================================= */}
-        {/* FINALISED VIEW: Payment & Split Dashboard */}
+        {/* FINALISED VIEW: Payment & Split Dashboard + Player Upload + Host Table */}
         {/* ========================================================================= */}
         {poll.status === 'finalised' && (
-          <div className="bg-gradient-to-br from-emerald-950/80 via-zinc-900 to-zinc-950 border border-emerald-500/50 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-6">
-            <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
-              <div>
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-semibold mb-2">
-                  <Sparkles className="w-3.5 h-3.5" /> Match Locked & Confirmed
+          <div className="space-y-6">
+            {/* Split & Venue Summary */}
+            <div className="bg-gradient-to-br from-emerald-950/80 via-zinc-900 to-zinc-950 border border-emerald-500/50 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-6">
+              <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
+                <div>
+                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-semibold mb-2">
+                    <Sparkles className="w-3.5 h-3.5" /> Match Locked & Confirmed
+                  </div>
+                  <h2 className="text-xl sm:text-2xl font-black text-white">
+                    Payment & Split Dashboard
+                  </h2>
                 </div>
-                <h2 className="text-xl sm:text-2xl font-black text-white">
-                  Payment & Split Dashboard
-                </h2>
+
+                {turfInfo && (
+                  <a
+                    href={`tel:${turfInfo.phone.replace(/\s+/g, '')}`}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs border border-zinc-700"
+                  >
+                    <Phone className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Call {turfInfo.name}</span>
+                  </a>
+                )}
               </div>
 
-              {turfInfo && (
-                <a
-                  href={`tel:${turfInfo.phone.replace(/\s+/g, '')}`}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs border border-zinc-700"
-                >
-                  <Phone className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Call {turfInfo.name}</span>
-                </a>
-              )}
-            </div>
-
-            {/* Match Summary Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800">
-                <span className="text-xs text-zinc-400 flex items-center gap-1 mb-1">
-                  <Calendar className="w-3.5 h-3.5 text-emerald-400" /> Date
-                </span>
-                <span className="text-sm font-bold text-white">{poll.final_date || 'TBD'}</span>
-              </div>
-
-              <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800">
-                <span className="text-xs text-zinc-400 flex items-center gap-1 mb-1">
-                  <Clock className="w-3.5 h-3.5 text-emerald-400" /> Time
-                </span>
-                <span className="text-sm font-bold text-white">{poll.final_time || 'TBD'}</span>
-              </div>
-
-              <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/30">
-                <span className="text-xs text-emerald-300 flex items-center gap-1 mb-1">
-                  <DollarSign className="w-3.5 h-3.5 text-emerald-400" /> Per Person Split
-                </span>
-                <span className="text-lg font-black text-emerald-400">
-                  ₹{costPerPerson}
-                  <span className="text-xs font-normal text-zinc-400 ml-1">
-                    (Total: ₹{poll.total_cost || 0} / {confirmedPlayersCount})
+              {/* Match Details Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800">
+                  <span className="text-xs text-zinc-400 flex items-center gap-1 mb-1">
+                    <Calendar className="w-3.5 h-3.5 text-emerald-400" /> Date
                   </span>
-                </span>
+                  <span className="text-sm font-bold text-white">{poll.final_date || 'TBD'}</span>
+                </div>
+
+                <div className="p-4 rounded-xl bg-zinc-950/80 border border-zinc-800">
+                  <span className="text-xs text-zinc-400 flex items-center gap-1 mb-1">
+                    <Clock className="w-3.5 h-3.5 text-emerald-400" /> Time
+                  </span>
+                  <span className="text-sm font-bold text-white">{poll.final_time || 'TBD'}</span>
+                </div>
+
+                <div className="p-4 rounded-xl bg-emerald-950/40 border border-emerald-500/30">
+                  <span className="text-xs text-emerald-300 flex items-center gap-1 mb-1">
+                    <DollarSign className="w-3.5 h-3.5 text-emerald-400" /> Per Person Split
+                  </span>
+                  <span className="text-lg font-black text-emerald-400">
+                    ₹{costPerPerson}
+                    <span className="text-xs font-normal text-zinc-400 ml-1">
+                      (Total: ₹{poll.total_cost || 0} / {confirmedPlayersCount})
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* Payment Details Card */}
+              <div className="p-5 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-4">
+                <h4 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <QrCode className="w-4 h-4 text-emerald-400" />
+                  Host Payment Details ({poll.host_name})
+                </h4>
+
+                <div className="flex flex-col sm:flex-row items-center gap-6">
+                  {poll.qr_code_url ? (
+                    <div className="p-2 bg-white rounded-xl shadow-lg shrink-0">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={poll.qr_code_url}
+                        alt="Payment QR Code"
+                        className="w-36 h-36 object-contain rounded-lg"
+                      />
+                    </div>
+                  ) : (
+                    <div className="w-36 h-36 rounded-xl bg-zinc-900 border border-zinc-800 flex flex-col items-center justify-center text-zinc-500 p-2 text-center text-xs shrink-0">
+                      <QrCode className="w-8 h-8 mb-1 text-zinc-600" />
+                      <span>No QR uploaded</span>
+                    </div>
+                  )}
+
+                  <div className="space-y-2 text-center sm:text-left">
+                    <div className="text-xs text-zinc-400">UPI ID / Phone:</div>
+                    <div className="text-base font-bold text-emerald-300 font-mono bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 inline-block">
+                      {poll.payment_info || 'Ask host directly for UPI info'}
+                    </div>
+                    <p className="text-xs text-zinc-400 max-w-sm">
+                      Please send <strong>₹{costPerPerson}</strong> and upload your payment confirmation screenshot below.
+                    </p>
+                  </div>
+                </div>
               </div>
             </div>
 
-            {/* Payment Details Section */}
-            <div className="p-5 rounded-xl bg-zinc-950/90 border border-zinc-800 space-y-4">
-              <h4 className="text-xs font-semibold text-zinc-300 uppercase tracking-wider flex items-center gap-1.5">
-                <QrCode className="w-4 h-4 text-emerald-400" />
-                How to Pay the Host ({poll.host_name})
-              </h4>
+            {/* PLAYER PAYMENT & SCREENSHOT UPLOAD COMPONENT (FEATURE 3) */}
+            <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-6">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <h3 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
+                    <Receipt className="w-5 h-5 text-emerald-400" />
+                    Submit Payment Screenshot
+                  </h3>
+                  <p className="text-zinc-400 text-xs sm:text-sm mt-1">
+                    Upload your UPI confirmation screenshot (GPay, PhonePe, Paytm) for AI verification by Gemini.
+                  </p>
+                </div>
 
-              <div className="flex flex-col sm:flex-row items-center gap-6">
-                {poll.qr_code_url ? (
-                  <div className="p-2 bg-white rounded-xl shadow-lg shrink-0">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={poll.qr_code_url}
-                      alt="Payment QR Code"
-                      className="w-36 h-36 object-contain rounded-lg"
+                {currentPlayerPayment && (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-zinc-400">Your status:</span>
+                    <span
+                      className={`text-xs font-semibold px-2.5 py-1 rounded-full uppercase ${
+                        currentPlayerPayment.final_status === 'valid'
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                          : currentPlayerPayment.final_status === 'invalid'
+                          ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                          : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                      }`}
+                    >
+                      {currentPlayerPayment.final_status}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {paymentUploadMsg && (
+                <div
+                  className={`p-4 rounded-xl text-xs sm:text-sm border ${
+                    paymentUploadMsg.type === 'success'
+                      ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-200'
+                      : paymentUploadMsg.type === 'warning'
+                      ? 'bg-amber-950/60 border-amber-500/40 text-amber-200'
+                      : 'bg-rose-950/60 border-rose-500/40 text-rose-200'
+                  }`}
+                >
+                  <div className="font-semibold mb-1">{paymentUploadMsg.text}</div>
+                  {paymentUploadMsg.details?.reasons && (
+                    <ul className="list-disc pl-4 space-y-0.5 text-xs opacity-90">
+                      {paymentUploadMsg.details.reasons.map((r: string, idx: number) => (
+                        <li key={idx}>{r}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {paymentUploadMsg.details?.transaction_id && (
+                    <div className="text-[11px] font-mono mt-1 opacity-80">
+                      Txn ID: {paymentUploadMsg.details.transaction_id}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <form onSubmit={handleUploadPaymentScreenshot} className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
+                      <User className="w-3.5 h-3.5 text-emerald-400" />
+                      Player Name
+                    </label>
+                    <input
+                      type="text"
+                      value={voterName}
+                      onChange={(e) => setVoterName(e.target.value)}
+                      placeholder="e.g. Atharv Shete"
+                      required
+                      className="w-full px-3.5 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-700 focus:border-emerald-400 text-white text-xs sm:text-sm outline-none"
                     />
                   </div>
-                ) : (
-                  <div className="w-36 h-36 rounded-xl bg-zinc-900 border border-zinc-800 flex flex-col items-center justify-center text-zinc-500 p-2 text-center text-xs shrink-0">
-                    <QrCode className="w-8 h-8 mb-1 text-zinc-600" />
-                    <span>No QR uploaded</span>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
+                      <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
+                      Amount to Pay
+                    </label>
+                    <div className="px-3.5 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-800 text-emerald-400 font-bold text-xs sm:text-sm">
+                      ₹{costPerPerson}
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
+                    <Upload className="w-3.5 h-3.5 text-emerald-400" />
+                    Payment Screenshot File
+                  </label>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    required
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files[0]) {
+                        const file = e.target.files[0];
+                        setPaymentScreenshotFile(file);
+                        setPreviewUrl(URL.createObjectURL(file));
+                      }
+                    }}
+                    className="w-full text-xs text-zinc-400 file:mr-3 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-emerald-600 file:text-white hover:file:bg-emerald-500 cursor-pointer"
+                  />
+                </div>
+
+                {previewUrl && (
+                  <div className="flex items-center gap-4 p-3 rounded-xl bg-zinc-950/80 border border-zinc-800">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={previewUrl}
+                      alt="Preview"
+                      className="w-16 h-16 object-cover rounded-lg border border-zinc-700"
+                    />
+                    <div className="text-xs text-zinc-300">
+                      <div className="font-semibold text-white">{paymentScreenshotFile?.name}</div>
+                      <div className="text-zinc-500">{(paymentScreenshotFile!.size / 1024).toFixed(1)} KB • Ready for AI verification</div>
+                    </div>
                   </div>
                 )}
 
-                <div className="space-y-2 text-center sm:text-left">
-                  <div className="text-xs text-zinc-400">UPI ID / Payment Info:</div>
-                  <div className="text-base font-bold text-emerald-300 font-mono bg-zinc-900 px-3 py-1.5 rounded-lg border border-zinc-800 inline-block">
-                    {poll.payment_info || 'Ask host directly for payment details'}
+                <button
+                  type="submit"
+                  disabled={isUploadingPayment || !paymentScreenshotFile}
+                  className="w-full py-3 px-5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-zinc-950 font-bold text-sm shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2 cursor-pointer transition disabled:opacity-60"
+                >
+                  {isUploadingPayment ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Gemini AI is Verifying Screenshot...
+                    </>
+                  ) : (
+                    <>
+                      <FileCheck className="w-4 h-4" />
+                      Upload & Verify Payment with Gemini
+                    </>
+                  )}
+                </button>
+              </form>
+            </div>
+
+            {/* ========================================================================= */}
+            {/* HOST MANAGEMENT DASHBOARD TABLE (FEATURE 3) */}
+            {/* ========================================================================= */}
+            {isHost && (
+              <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-6">
+                <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
+                  <div>
+                    <h3 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
+                      <ShieldCheck className="w-5 h-5 text-emerald-400" />
+                      Host Management Dashboard
+                    </h3>
+                    <p className="text-zinc-400 text-xs sm:text-sm mt-1">
+                      Track attendance, AI verification verdicts from Gemini, and override payment statuses when needed.
+                    </p>
                   </div>
-                  <p className="text-xs text-zinc-400 max-w-sm">
-                    Please pay <strong>₹{costPerPerson}</strong> to the host promptly so the slot reservation remains confirmed.
-                  </p>
+                  <div className="text-xs font-medium text-emerald-400 bg-emerald-950/60 px-3 py-1.5 rounded-lg border border-emerald-500/30">
+                    Total Collected: ₹
+                    {payments
+                      .filter((p) => p.final_status === 'valid')
+                      .reduce((sum, p) => sum + (Number(p.amount_paid) || 0), 0)}
+                    {' '}/ ₹{poll.total_cost || 0}
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs sm:text-sm">
+                    <thead>
+                      <tr className="border-b border-zinc-800 text-zinc-400 uppercase text-[11px] tracking-wider">
+                        <th className="py-3 px-3">Player</th>
+                        <th className="py-3 px-3">Attendance</th>
+                        <th className="py-3 px-3">Gemini Verdict</th>
+                        <th className="py-3 px-3">Amount & Txn ID</th>
+                        <th className="py-3 px-3">Screenshot</th>
+                        <th className="py-3 px-3 text-right">Host Override</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-800/60">
+                      {/* Combine all confirmed players and any player who submitted payment */}
+                      {Array.from(
+                        new Set([...comingList.map((v) => v.voter_name), ...payments.map((p) => p.player_name)])
+                      ).map((playerName) => {
+                        const playerVote = votes.find(
+                          (v) => v.voter_name.toLowerCase() === playerName.toLowerCase()
+                        );
+                        const playerPayment = payments.find(
+                          (p) => p.player_name.toLowerCase() === playerName.toLowerCase()
+                        );
+
+                        return (
+                          <tr key={playerName} className="hover:bg-zinc-800/30 transition">
+                            {/* Player Name */}
+                            <td className="py-3.5 px-3 font-semibold text-white">
+                              {playerName}
+                              {poll.host_name.toLowerCase() === playerName.toLowerCase() && (
+                                <span className="ml-1.5 text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded">
+                                  Host
+                                </span>
+                              )}
+                            </td>
+
+                            {/* Attendance */}
+                            <td className="py-3.5 px-3">
+                              {playerVote?.coming ? (
+                                <span className="inline-flex items-center gap-1 text-emerald-400 text-xs">
+                                  <CheckCircle2 className="w-3.5 h-3.5" /> Playing
+                                </span>
+                              ) : playerVote ? (
+                                <span className="inline-flex items-center gap-1 text-zinc-500 text-xs">
+                                  <XCircle className="w-3.5 h-3.5" /> Not Coming
+                                </span>
+                              ) : (
+                                <span className="text-zinc-600 text-xs">No vote</span>
+                              )}
+                            </td>
+
+                            {/* Gemini AI Verdict */}
+                            <td className="py-3.5 px-3">
+                              {playerPayment ? (
+                                <div className="space-y-1">
+                                  <span
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-semibold uppercase ${
+                                      playerPayment.gemini_verdict === 'valid'
+                                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                                        : playerPayment.gemini_verdict === 'invalid'
+                                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
+                                        : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                                    }`}
+                                  >
+                                    {playerPayment.gemini_verdict === 'valid' && <CheckCircle2 className="w-3 h-3" />}
+                                    {playerPayment.gemini_verdict === 'invalid' && <XCircle className="w-3 h-3" />}
+                                    {playerPayment.gemini_verdict === 'suspicious' && <AlertTriangle className="w-3 h-3" />}
+                                    {playerPayment.gemini_verdict}
+                                  </span>
+
+                                  {playerPayment.is_manual_override && (
+                                    <div className="text-[10px] text-zinc-400 italic">
+                                      Status: <strong className="text-white">{playerPayment.final_status}</strong> (Overridden)
+                                    </div>
+                                  )}
+
+                                  {playerPayment.reasons && playerPayment.reasons.length > 0 && (
+                                    <div className="text-[10px] text-zinc-400 max-w-xs truncate" title={playerPayment.reasons.join('\n')}>
+                                      {playerPayment.reasons[0]}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-zinc-500 text-xs italic">Unpaid</span>
+                              )}
+                            </td>
+
+                            {/* Amount & Txn ID */}
+                            <td className="py-3.5 px-3">
+                              {playerPayment ? (
+                                <div>
+                                  <div className="font-semibold text-white">
+                                    ₹{playerPayment.amount_paid}
+                                  </div>
+                                  <div className="text-[10px] font-mono text-zinc-400 truncate max-w-[120px]" title={playerPayment.transaction_id || 'N/A'}>
+                                    Txn: {playerPayment.transaction_id || 'N/A'}
+                                  </div>
+                                </div>
+                              ) : (
+                                <span className="text-zinc-600 text-xs">—</span>
+                              )}
+                            </td>
+
+                            {/* Screenshot Link */}
+                            <td className="py-3.5 px-3">
+                              {playerPayment?.screenshot_url ? (
+                                <a
+                                  href={playerPayment.screenshot_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300 underline"
+                                >
+                                  View
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              ) : (
+                                <span className="text-zinc-600 text-xs">—</span>
+                              )}
+                            </td>
+
+                            {/* Host Manual Override Actions */}
+                            <td className="py-3.5 px-3 text-right">
+                              {playerPayment ? (
+                                <div className="inline-flex items-center gap-1.5">
+                                  <button
+                                    type="button"
+                                    disabled={overrideLoadingId === playerPayment.id}
+                                    onClick={() => handleHostManualOverride(playerPayment.id, 'valid')}
+                                    className={`px-2 py-1 rounded text-[11px] font-semibold cursor-pointer transition ${
+                                      playerPayment.final_status === 'valid'
+                                        ? 'bg-emerald-500 text-zinc-950 font-bold'
+                                        : 'bg-zinc-800 hover:bg-emerald-950 text-zinc-300 hover:text-emerald-300'
+                                    }`}
+                                  >
+                                    Force Valid
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={overrideLoadingId === playerPayment.id}
+                                    onClick={() => handleHostManualOverride(playerPayment.id, 'invalid')}
+                                    className={`px-2 py-1 rounded text-[11px] font-semibold cursor-pointer transition ${
+                                      playerPayment.final_status === 'invalid'
+                                        ? 'bg-rose-600 text-white font-bold'
+                                        : 'bg-zinc-800 hover:bg-rose-950 text-zinc-300 hover:text-rose-300'
+                                    }`}
+                                  >
+                                    Force Invalid
+                                  </button>
+                                </div>
+                              ) : (
+                                <span className="text-zinc-600 text-xs italic">Awaiting upload</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
               </div>
-            </div>
+            )}
           </div>
         )}
       </div>

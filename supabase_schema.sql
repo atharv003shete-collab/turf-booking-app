@@ -1,4 +1,4 @@
--- SQL Schema for Turf Booking App (Phase 1 + Phase 2)
+-- SQL Schema for Turf Booking App (Phase 1 + Phase 2 + Phase 3)
 
 -- 1. Create polls table
 CREATE TABLE IF NOT EXISTS public.polls (
@@ -47,13 +47,32 @@ CREATE TABLE IF NOT EXISTS public.option_votes (
     CONSTRAINT option_votes_option_id_voter_name_key UNIQUE (option_id, voter_name)
 );
 
--- 5. Enable Row Level Security (RLS)
+-- 5. Create payments table (Phase 3 Payments & Gemini Verification)
+CREATE TABLE IF NOT EXISTS public.payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    poll_id UUID NOT NULL REFERENCES public.polls(id) ON DELETE CASCADE,
+    player_name TEXT NOT NULL,
+    amount_paid NUMERIC NOT NULL DEFAULT 0,
+    expected_amount NUMERIC NOT NULL DEFAULT 0,
+    screenshot_url TEXT NOT NULL,
+    transaction_id TEXT,
+    receiver_name_or_upi TEXT,
+    gemini_verdict TEXT NOT NULL DEFAULT 'suspicious', -- 'valid', 'suspicious', 'invalid'
+    final_status TEXT NOT NULL DEFAULT 'pending', -- 'valid', 'invalid', 'pending'
+    reasons JSONB DEFAULT '[]'::jsonb,
+    is_manual_override BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+-- 6. Enable Row Level Security (RLS)
 ALTER TABLE public.polls ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.votes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.poll_options ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.option_votes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
 
--- 6. Policies for public access (anon key)
+-- 7. Policies for public access (anon key)
 CREATE POLICY "Allow public read access to polls"
     ON public.polls FOR SELECT USING (true);
 CREATE POLICY "Allow public insert to polls"
@@ -76,13 +95,19 @@ CREATE POLICY "Allow public read access to option_votes"
 CREATE POLICY "Allow public insert and delete to option_votes"
     ON public.option_votes FOR ALL USING (true);
 
--- 7. Realtime publications
+CREATE POLICY "Allow public read access to payments"
+    ON public.payments FOR SELECT USING (true);
+CREATE POLICY "Allow public insert and update to payments"
+    ON public.payments FOR ALL USING (true);
+
+-- 8. Realtime publications
 ALTER PUBLICATION supabase_realtime ADD TABLE public.polls;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.votes;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.poll_options;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.option_votes;
+ALTER PUBLICATION supabase_realtime ADD TABLE public.payments;
 
--- 8. Storage bucket for QR screenshots
+-- 9. Storage bucket for screenshots
 -- INSERT INTO storage.buckets (id, name, public) VALUES ('screenshots', 'screenshots', true) ON CONFLICT DO NOTHING;
 -- CREATE POLICY "Allow public uploads to screenshots bucket" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'screenshots');
 -- CREATE POLICY "Allow public view to screenshots bucket" ON storage.objects FOR SELECT USING (bucket_id = 'screenshots');
