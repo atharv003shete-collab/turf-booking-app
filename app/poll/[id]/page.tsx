@@ -447,12 +447,14 @@ function PollContent({ params }: PollPageProps) {
       localStorage.setItem('turf_voter_name', voterNameStr);
     }
 
-    const existingVote = !!userVotes[optionId]; // tracks if current user voted for this option
+    // 1. Check directly against live optionVotes array whether current user has voted for this option
+    const existingVote = optionVotes.some(
+      (ov) =>
+        ov.option_id === optionId &&
+        ov.voter_name.trim().toLowerCase() === voterNameStr.toLowerCase()
+    );
 
-    // 1. Optimistically update local UI state immediately
-    setUserVotes((prev) => ({ ...prev, [optionId]: !existingVote }));
-
-    // Also optimistically reflect in optionVotes for live badges & names
+    // 2. Optimistically update local optionVotes array so UI updates instantly
     if (existingVote) {
       setOptionVotes((prev) =>
         prev.filter(
@@ -475,36 +477,37 @@ function PollContent({ params }: PollPageProps) {
       ]);
     }
 
-    if (existingVote) {
-      // Remove vote from database
-      const { error } = await supabase
-        .from('option_votes')
-        .delete()
-        .eq('option_id', optionId)
-        .eq('voter_name', voterNameStr);
+    // 3. Make sure the click handler updates Supabase and immediately triggers a state refresh
+    try {
+      if (existingVote) {
+        // Remove vote from database
+        const { error } = await supabase
+          .from('option_votes')
+          .delete()
+          .eq('option_id', optionId)
+          .eq('voter_name', voterNameStr);
 
-      if (error) {
-        // Revert on failure
-        setUserVotes((prev) => ({ ...prev, [optionId]: true }));
-        console.error('Error removing vote:', error);
-      }
-    } else {
-      // Add vote to database
-      const { error } = await supabase.from('option_votes').insert({
-        option_id: optionId,
-        poll_id: pollId,
-        voter_name: voterNameStr,
-      });
+        if (error) {
+          console.error('Error removing vote:', error);
+        }
+      } else {
+        // Add vote to database
+        const { error } = await supabase.from('option_votes').insert({
+          option_id: optionId,
+          poll_id: pollId,
+          voter_name: voterNameStr,
+        });
 
-      if (error) {
-        // Revert on failure
-        setUserVotes((prev) => ({ ...prev, [optionId]: false }));
-        console.error('Error adding vote:', error);
+        if (error) {
+          console.error('Error adding vote:', error);
+        }
       }
+    } catch (dbErr) {
+      console.error('Database update error:', dbErr);
+    } finally {
+      // Immediately refresh votes from Supabase so the UI stays permanently in sync
+      await fetchVotesData();
     }
-
-    // Refresh votes list from Supabase to sync counts and voter names
-    await fetchVotesData();
   };
 
   // Finalise Poll Form Submission (Host Only)
@@ -701,16 +704,18 @@ function PollContent({ params }: PollPageProps) {
     return optionVotes.filter((ov) => ov.option_id === optionId);
   };
   const hasUserVotedOption = (optionId: string) => {
-    if (userVotes[optionId] !== undefined) {
-      return !!userVotes[optionId];
-    }
     const currentName = (
       (typeof window !== 'undefined'
         ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name')
         : '') || voterName
     ).trim().toLowerCase();
+
+    // Check directly against the fetched/live votes table where voter_name matches the current user
     return optionVotes.some(
-      (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === currentName
+      (ov) =>
+        ov.option_id === optionId &&
+        ov.voter_name &&
+        ov.voter_name.trim().toLowerCase() === currentName
     );
   };
 
@@ -1053,7 +1058,15 @@ function PollContent({ params }: PollPageProps) {
               ) : (
                 options.map((opt) => {
                   const optVoters = getVotesForOption(opt.id);
-                  const isVoted = hasUserVotedOption(opt.id);
+                  const voterNamesList = optVoters.map((v) => v.voter_name?.trim().toLowerCase()).filter(Boolean);
+                  const currentVoter = (
+                    (typeof window !== 'undefined'
+                      ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name')
+                      : '') || voterName
+                  ).trim().toLowerCase();
+
+                  // 1. Check live voters array directly to determine active state
+                  const hasVoted = Boolean(currentVoter && voterNamesList.includes(currentVoter));
                   const label = getOptionLabel(opt);
                   const votePercentage = Math.round((optVoters.length / maxVotesOnAnyOption) * 100);
 
@@ -1068,54 +1081,67 @@ function PollContent({ params }: PollPageProps) {
                       className={`relative overflow-hidden rounded-xl border p-4 transition-all duration-150 select-none ${
                         poll.status !== 'finalised' ? 'cursor-pointer hover:border-emerald-500/60' : 'cursor-default'
                       } ${
-                        isVoted
-                          ? 'bg-emerald-950/30 border-emerald-500/60 shadow-lg shadow-emerald-950/40'
+                        hasVoted
+                          ? 'bg-emerald-950/40 border-emerald-500 ring-1 ring-emerald-500/30 shadow-lg shadow-emerald-950/50'
                           : 'bg-zinc-950/60 border-zinc-800/80 hover:bg-zinc-900/60'
                       }`}
                     >
                       {/* WhatsApp-Style Progress Fill Background */}
                       <div
                         className={`absolute inset-y-0 left-0 transition-all duration-500 pointer-events-none ${
-                          isVoted ? 'bg-emerald-500/15' : 'bg-zinc-800/25'
+                          hasVoted ? 'bg-emerald-500/20' : 'bg-zinc-800/25'
                         }`}
                         style={{ width: `${votePercentage}%` }}
                       />
 
                       <div className="relative z-10 flex items-start justify-between gap-3">
                         <div className="flex items-start gap-3 flex-1 min-w-0">
-                          {/* WhatsApp-Style Circular Checkbox Indicator */}
+                          {/* 2. Green checkmark indicator */}
                           <div
                             className={`w-5 h-5 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 transition ${
-                              isVoted
-                                ? 'bg-emerald-500 border-emerald-500 text-zinc-950 shadow-sm'
+                              hasVoted
+                                ? 'bg-emerald-500 border-emerald-500 text-zinc-950 shadow-md shadow-emerald-500/30'
                                 : 'border-zinc-600 bg-zinc-900/80'
                             }`}
                           >
-                            {isVoted && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                            {hasVoted && <Check className="w-3.5 h-3.5 stroke-[3]" />}
                           </div>
 
                           {/* Option Text and Voter Avatar Names */}
                           <div className="space-y-1.5 flex-1 min-w-0">
-                            <div className={`text-sm sm:text-base font-semibold ${isVoted ? 'text-white' : 'text-zinc-200'}`}>
-                              {label}
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`text-sm sm:text-base font-semibold ${hasVoted ? 'text-white' : 'text-zinc-200'}`}>
+                                {label}
+                              </span>
+
+                              {/* 2. VOTED badge whenever hasVoted is true */}
+                              {hasVoted && (
+                                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold tracking-wider bg-emerald-500 text-zinc-950 shadow-sm uppercase">
+                                  VOTED
+                                </span>
+                              )}
                             </div>
 
                             {/* Voters list pill */}
                             {optVoters.length > 0 ? (
                               <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                                {optVoters.map((v) => (
-                                  <span
-                                    key={v.id || v.voter_name}
-                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium ${
-                                      v.voter_name.toLowerCase() === voterName.trim().toLowerCase()
-                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                        : 'bg-zinc-800/80 text-zinc-400 border border-zinc-700/50'
-                                    }`}
-                                  >
-                                    <User className="w-2.5 h-2.5" />
-                                    {v.voter_name}
-                                  </span>
-                                ))}
+                                {optVoters.map((v) => {
+                                  const isSelf = v.voter_name?.trim().toLowerCase() === currentVoter;
+                                  return (
+                                    <span
+                                      key={v.id || `${opt.id}-${v.voter_name}`}
+                                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition ${
+                                        isSelf
+                                          ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/40 font-semibold'
+                                          : 'bg-zinc-800/80 text-zinc-400 border border-zinc-700/50'
+                                      }`}
+                                    >
+                                      <User className="w-2.5 h-2.5" />
+                                      {v.voter_name}
+                                      {isSelf && ' (You)'}
+                                    </span>
+                                  );
+                                })}
                               </div>
                             ) : (
                               <div className="text-[11px] text-zinc-500 italic">No votes yet</div>
@@ -1126,8 +1152,8 @@ function PollContent({ params }: PollPageProps) {
                         {/* Vote count badge */}
                         <div className="text-right shrink-0">
                           <span
-                            className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-bold ${
-                              isVoted
+                            className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-bold transition ${
+                              hasVoted
                                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                                 : 'bg-zinc-800 text-zinc-400'
                             }`}
