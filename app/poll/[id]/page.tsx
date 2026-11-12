@@ -392,69 +392,95 @@ function PollContent({ params }: PollPageProps) {
       return;
     }
 
-    setOptionActionId(optionId);
-    try {
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('turf_voter_name', trimmedName);
-      }
+    // Persist voter name immediately so future actions are seamless
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('turf_voter_name', trimmedName);
+    }
 
-      // 1. Check if the current user has already voted for this option
-      const existing = optionVotes.find(
-        (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === trimmedName.toLowerCase()
+    // 1. Check whether the current user has already voted for this option in the local state
+    const isCurrentlyVoted = optionVotes.some(
+      (ov) =>
+        ov.option_id === optionId &&
+        ov.voter_name.trim().toLowerCase() === trimmedName.toLowerCase()
+    );
+
+    // 2. Optimistically update local state immediately so checkbox/button is visually toggled on/off
+    if (isCurrentlyVoted) {
+      // Optimistically remove vote
+      setOptionVotes((prev) =>
+        prev.filter(
+          (ov) =>
+            !(
+              ov.option_id === optionId &&
+              ov.voter_name.trim().toLowerCase() === trimmedName.toLowerCase()
+            )
+        )
       );
+    } else {
+      // Optimistically add vote (locks in checked state immediately)
+      const optimisticRecord: OptionVote = {
+        id: `optimistic-${optionId}-${Date.now()}`,
+        option_id: optionId,
+        poll_id: pollId,
+        voter_name: trimmedName,
+      };
+      setOptionVotes((prev) => [...prev, optimisticRecord]);
+    }
 
-      if (existing) {
-        // 3. If already voted, delete that record from 'option_votes' to allow unvoting
-        // Optimistically update local state
-        setOptionVotes((prev) => prev.filter((ov) => ov.id !== existing.id));
+    setOptionActionId(optionId);
 
+    // 3. Perform the async database insert/delete on 'option_votes'
+    try {
+      if (isCurrentlyVoted) {
+        // Delete record from 'option_votes'
         const { error } = await supabase
           .from('option_votes')
           .delete()
-          .match({ option_id: optionId, voter_name: existing.voter_name });
+          .eq('option_id', optionId)
+          .ilike('voter_name', trimmedName);
 
         if (error) {
-          // If match failed, retry deleting by id
-          await supabase.from('option_votes').delete().eq('id', existing.id);
+          console.warn('Delete by option_id & voter_name failed, trying alternative:', error.message);
+          await supabase
+            .from('option_votes')
+            .delete()
+            .match({ option_id: optionId, voter_name: trimmedName });
         }
       } else {
-        // 2. If not voted, insert a record into the 'option_votes' table with { option_id, poll_id, voter_name }
-        // Optimistically update local state
-        const tempId = 'temp-' + Date.now();
-        setOptionVotes((prev) => [
-          ...prev,
-          { id: tempId, option_id: optionId, poll_id: pollId, voter_name: trimmedName },
-        ]);
-
+        // Insert record into 'option_votes'
         const { error } = await supabase.from('option_votes').insert({
           option_id: optionId,
           poll_id: pollId,
           voter_name: trimmedName,
         });
 
-        if (error) throw error;
+        if (error) {
+          console.error('Error inserting option vote:', error);
+          throw error;
+        }
       }
 
-      // 4. Immediately re-fetch the option_votes state so live counts and voter names update instantly
-      const { data: updatedOptionVotes, error: refetchErr } = await supabase
+      // Immediately re-fetch the latest votes from Supabase so checked state stays locked in
+      const { data: latestVotes, error: refetchErr } = await supabase
         .from('option_votes')
         .select('*')
         .eq('poll_id', pollId);
 
-      if (!refetchErr && updatedOptionVotes) {
-        setOptionVotes(updatedOptionVotes);
+      if (!refetchErr && latestVotes) {
+        // Lock in confirmed database state
+        setOptionVotes(latestVotes);
       }
-
-      // Also refresh full poll data in background
-      await fetchPollData();
     } catch (err: any) {
-      console.error('Error voting on option:', err);
-      // Re-fetch to synchronize state in case of error
-      const { data: rollbackVotes } = await supabase
+      console.error('Failed to sync option vote:', err);
+      // Re-fetch database state to reconcile any discrepancy
+      const { data: syncedVotes } = await supabase
         .from('option_votes')
         .select('*')
         .eq('poll_id', pollId);
-      if (rollbackVotes) setOptionVotes(rollbackVotes);
+
+      if (syncedVotes) {
+        setOptionVotes(syncedVotes);
+      }
     } finally {
       setOptionActionId(null);
     }
