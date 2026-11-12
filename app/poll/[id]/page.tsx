@@ -106,6 +106,7 @@ function PollContent({ params }: PollPageProps) {
   const [votes, setVotes] = useState<Vote[]>([]);
   const [options, setOptions] = useState<PollOption[]>([]);
   const [optionVotes, setOptionVotes] = useState<OptionVote[]>([]);
+  const [userVotes, setUserVotes] = useState<{ [optionId: string]: boolean }>({});
   const [payments, setPayments] = useState<PaymentRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -217,7 +218,23 @@ function PollContent({ params }: PollPageProps) {
       if (optVoteError && optVoteError.code !== '42P01') {
         console.warn('Option votes fetch error:', optVoteError);
       }
-      setOptionVotes(optVoteData || []);
+      const fetchedOptionVotes: OptionVote[] = optVoteData || [];
+      setOptionVotes(fetchedOptionVotes);
+
+      // Populate userVotes map for the current voter
+      const activeName = (
+        (typeof window !== 'undefined' ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name') : '') || voterName
+      ).trim().toLowerCase();
+
+      if (activeName) {
+        const votesMap: { [optionId: string]: boolean } = {};
+        fetchedOptionVotes.forEach((ov) => {
+          if (ov.voter_name.trim().toLowerCase() === activeName) {
+            votesMap[ov.option_id] = true;
+          }
+        });
+        setUserVotes(votesMap);
+      }
 
       // 5. Fetch Payments (Phase 3)
       const { data: paymentData, error: paymentError } = await supabase
@@ -267,7 +284,7 @@ function PollContent({ params }: PollPageProps) {
   }, [pollId]);
 
   // Phase 1: Attendance Vote
-  const handleVote = async (coming: boolean) => {
+  const handleAttendanceVote = async (coming: boolean) => {
     const trimmedName = voterName.trim();
     if (!trimmedName) {
       setFeedbackMsg({ type: 'error', text: 'Please enter your name to vote.' });
@@ -279,6 +296,7 @@ function PollContent({ params }: PollPageProps) {
 
     try {
       if (typeof window !== 'undefined') {
+        localStorage.setItem('voter_name', trimmedName);
         localStorage.setItem('turf_voter_name', trimmedName);
       }
 
@@ -384,106 +402,109 @@ function PollContent({ params }: PollPageProps) {
     }
   };
 
-  // Phase 2: Multi-option WhatsApp-style voting (toggle vote on option)
-  const handleToggleVoteOnOption = async (optionId: string) => {
-    const trimmedName = voterName.trim();
-    if (!trimmedName) {
-      alert('Please enter your name first in the top bar to vote on options.');
-      return;
-    }
+  // Helper to re-fetch votes list from Supabase to sync counts and voter names
+  const fetchVotesData = async () => {
+    try {
+      const { data: latestVotes, error } = await supabase
+        .from('option_votes')
+        .select('*')
+        .eq('poll_id', pollId);
 
-    // Persist voter name immediately so future actions are seamless
+      if (!error && latestVotes) {
+        setOptionVotes(latestVotes);
+
+        const activeName = (
+          (typeof window !== 'undefined'
+            ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name')
+            : '') || voterName
+        ).trim().toLowerCase();
+
+        if (activeName) {
+          const votesMap: { [optionId: string]: boolean } = {};
+          latestVotes.forEach((ov) => {
+            if (ov.voter_name.trim().toLowerCase() === activeName) {
+              votesMap[ov.option_id] = true;
+            }
+          });
+          setUserVotes(votesMap);
+        }
+      }
+    } catch (err) {
+      console.error('Error in fetchVotesData:', err);
+    }
+  };
+
+  // Phase 2: Multi-option WhatsApp-style voting (handleVote)
+  const handleVote = async (optionId: string) => {
+    const voterNameStr =
+      (typeof window !== 'undefined'
+        ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name')
+        : '') || voterName.trim() || 'Guest';
+
+    // Keep voter_name synced in localStorage
     if (typeof window !== 'undefined') {
-      localStorage.setItem('turf_voter_name', trimmedName);
+      localStorage.setItem('voter_name', voterNameStr);
+      localStorage.setItem('turf_voter_name', voterNameStr);
     }
 
-    // 1. Check whether the current user has already voted for this option in the local state
-    const isCurrentlyVoted = optionVotes.some(
-      (ov) =>
-        ov.option_id === optionId &&
-        ov.voter_name.trim().toLowerCase() === trimmedName.toLowerCase()
-    );
+    const existingVote = !!userVotes[optionId]; // tracks if current user voted for this option
 
-    // 2. Optimistically update local state immediately so checkbox/button is visually toggled on/off
-    if (isCurrentlyVoted) {
-      // Optimistically remove vote
+    // 1. Optimistically update local UI state immediately
+    setUserVotes((prev) => ({ ...prev, [optionId]: !existingVote }));
+
+    // Also optimistically reflect in optionVotes for live badges & names
+    if (existingVote) {
       setOptionVotes((prev) =>
         prev.filter(
           (ov) =>
             !(
               ov.option_id === optionId &&
-              ov.voter_name.trim().toLowerCase() === trimmedName.toLowerCase()
+              ov.voter_name.trim().toLowerCase() === voterNameStr.toLowerCase()
             )
         )
       );
     } else {
-      // Optimistically add vote (locks in checked state immediately)
-      const optimisticRecord: OptionVote = {
-        id: `optimistic-${optionId}-${Date.now()}`,
-        option_id: optionId,
-        poll_id: pollId,
-        voter_name: trimmedName,
-      };
-      setOptionVotes((prev) => [...prev, optimisticRecord]);
-    }
-
-    setOptionActionId(optionId);
-
-    // 3. Perform the async database insert/delete on 'option_votes'
-    try {
-      if (isCurrentlyVoted) {
-        // Delete record from 'option_votes'
-        const { error } = await supabase
-          .from('option_votes')
-          .delete()
-          .eq('option_id', optionId)
-          .ilike('voter_name', trimmedName);
-
-        if (error) {
-          console.warn('Delete by option_id & voter_name failed, trying alternative:', error.message);
-          await supabase
-            .from('option_votes')
-            .delete()
-            .match({ option_id: optionId, voter_name: trimmedName });
-        }
-      } else {
-        // Insert record into 'option_votes'
-        const { error } = await supabase.from('option_votes').insert({
+      setOptionVotes((prev) => [
+        ...prev,
+        {
+          id: `opt-${optionId}-${Date.now()}`,
           option_id: optionId,
           poll_id: pollId,
-          voter_name: trimmedName,
-        });
-
-        if (error) {
-          console.error('Error inserting option vote:', error);
-          throw error;
-        }
-      }
-
-      // Immediately re-fetch the latest votes from Supabase so checked state stays locked in
-      const { data: latestVotes, error: refetchErr } = await supabase
-        .from('option_votes')
-        .select('*')
-        .eq('poll_id', pollId);
-
-      if (!refetchErr && latestVotes) {
-        // Lock in confirmed database state
-        setOptionVotes(latestVotes);
-      }
-    } catch (err: any) {
-      console.error('Failed to sync option vote:', err);
-      // Re-fetch database state to reconcile any discrepancy
-      const { data: syncedVotes } = await supabase
-        .from('option_votes')
-        .select('*')
-        .eq('poll_id', pollId);
-
-      if (syncedVotes) {
-        setOptionVotes(syncedVotes);
-      }
-    } finally {
-      setOptionActionId(null);
+          voter_name: voterNameStr,
+        },
+      ]);
     }
+
+    if (existingVote) {
+      // Remove vote from database
+      const { error } = await supabase
+        .from('option_votes')
+        .delete()
+        .eq('option_id', optionId)
+        .eq('voter_name', voterNameStr);
+
+      if (error) {
+        // Revert on failure
+        setUserVotes((prev) => ({ ...prev, [optionId]: true }));
+        console.error('Error removing vote:', error);
+      }
+    } else {
+      // Add vote to database
+      const { error } = await supabase.from('option_votes').insert({
+        option_id: optionId,
+        poll_id: pollId,
+        voter_name: voterNameStr,
+      });
+
+      if (error) {
+        // Revert on failure
+        setUserVotes((prev) => ({ ...prev, [optionId]: false }));
+        console.error('Error adding vote:', error);
+      }
+    }
+
+    // Refresh votes list from Supabase to sync counts and voter names
+    await fetchVotesData();
   };
 
   // Finalise Poll Form Submission (Host Only)
@@ -680,8 +701,16 @@ function PollContent({ params }: PollPageProps) {
     return optionVotes.filter((ov) => ov.option_id === optionId);
   };
   const hasUserVotedOption = (optionId: string) => {
+    if (userVotes[optionId] !== undefined) {
+      return !!userVotes[optionId];
+    }
+    const currentName = (
+      (typeof window !== 'undefined'
+        ? localStorage.getItem('voter_name') || localStorage.getItem('turf_voter_name')
+        : '') || voterName
+    ).trim().toLowerCase();
     return optionVotes.some(
-      (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === voterName.trim().toLowerCase()
+      (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === currentName
     );
   };
 
@@ -894,7 +923,7 @@ function PollContent({ params }: PollPageProps) {
             <button
               type="button"
               disabled={voteSubmitting || poll.status === 'finalised'}
-              onClick={() => handleVote(true)}
+              onClick={() => handleAttendanceVote(true)}
               className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-[0.99] text-white font-semibold text-sm transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-emerald-900/30"
             >
               <CheckCircle2 className="w-4 h-4" />
@@ -904,7 +933,7 @@ function PollContent({ params }: PollPageProps) {
             <button
               type="button"
               disabled={voteSubmitting || poll.status === 'finalised'}
-              onClick={() => handleVote(false)}
+              onClick={() => handleAttendanceVote(false)}
               className="flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-zinc-800 hover:bg-rose-950/80 hover:text-rose-200 hover:border-rose-500/40 border border-zinc-700 text-zinc-300 active:scale-[0.99] font-semibold text-sm transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
               <XCircle className="w-4 h-4" />
@@ -1033,7 +1062,7 @@ function PollContent({ params }: PollPageProps) {
                       key={opt.id}
                       onClick={() => {
                         if (poll.status !== 'finalised') {
-                          handleToggleVoteOnOption(opt.id);
+                          handleVote(opt.id);
                         }
                       }}
                       className={`relative overflow-hidden rounded-xl border p-4 transition-all duration-150 select-none ${
