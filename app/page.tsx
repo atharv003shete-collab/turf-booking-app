@@ -145,8 +145,8 @@ export default function HomePage() {
                   {TURF_LOCATIONS.map((group) => (
                     <optgroup key={group.location} label={`📍 ${group.location}`} className="bg-zinc-900 font-semibold text-emerald-400">
                       {group.turfs.map((turf) => (
-                        <option key={turf} value={turf} className="text-zinc-200 bg-zinc-950 font-normal">
-                          {turf}
+                        <option key={turf.name} value={turf.name} className="text-zinc-200 bg-zinc-950 font-normal">
+                          {turf.name} ({turf.phone})
                         </option>
                       ))}
                     </optgroup>
