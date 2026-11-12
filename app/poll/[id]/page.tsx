@@ -24,7 +24,6 @@ import {
   ExternalLink,
   ChevronRight,
   Plus,
-  ThumbsUp,
   DollarSign,
   Upload,
   QrCode,
@@ -33,6 +32,7 @@ import {
   AlertTriangle,
   Receipt,
   FileCheck,
+  Vote as VoteIcon,
 } from 'lucide-react';
 
 interface Poll {
@@ -60,8 +60,9 @@ interface Vote {
 interface PollOption {
   id: string;
   poll_id: string | number;
-  type: 'date' | 'time';
-  value: string;
+  option_text?: string;
+  value?: string;
+  type?: string;
   votes_count?: number;
   created_at?: string;
 }
@@ -117,9 +118,8 @@ function PollContent({ params }: PollPageProps) {
   const [voteSubmitting, setVoteSubmitting] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  // Phase 2 state
-  const [newDateValue, setNewDateValue] = useState('');
-  const [newTimeValue, setNewTimeValue] = useState('');
+  // Phase 2 state: WhatsApp-style combined option
+  const [newCombinedOption, setNewCombinedOption] = useState('');
   const [addingOption, setAddingOption] = useState(false);
   const [optionActionId, setOptionActionId] = useState<string | null>(null);
   const [advancingPhase, setAdvancingPhase] = useState(false);
@@ -195,7 +195,7 @@ function PollContent({ params }: PollPageProps) {
       }
       setVotes(voteData || []);
 
-      // 3. Fetch Poll Options (Phase 2)
+      // 3. Fetch Poll Options (Phase 2 WhatsApp Options)
       const { data: optData, error: optError } = await supabase
         .from('poll_options')
         .select('*')
@@ -328,61 +328,39 @@ function PollContent({ params }: PollPageProps) {
     }
   };
 
-  // Add Date Option (Phase 2)
-  const handleAddDateOption = async (e: React.FormEvent) => {
+  // Phase 2: Add WhatsApp-style combined Date & Time Option
+  const handleAddCombinedOption = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newDateValue.trim()) return;
+    const trimmedOption = newCombinedOption.trim();
+    if (!trimmedOption) return;
 
     setAddingOption(true);
     try {
+      // Store in both option_text and value so queries work on either schema version
       const { error } = await supabase.from('poll_options').insert([
         {
           poll_id: pollId,
-          type: 'date',
-          value: newDateValue.trim(),
+          option_text: trimmedOption,
+          value: trimmedOption,
+          type: 'combined',
         },
       ]);
       if (error) throw error;
-      setNewDateValue('');
+      setNewCombinedOption('');
       await fetchPollData();
     } catch (err: any) {
-      console.error('Error adding date option:', err);
-      alert('Failed to add date option: ' + err.message);
+      console.error('Error adding option:', err);
+      alert('Failed to add option: ' + err.message);
     } finally {
       setAddingOption(false);
     }
   };
 
-  // Add Time Option (Phase 2)
-  const handleAddTimeOption = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newTimeValue.trim()) return;
-
-    setAddingOption(true);
-    try {
-      const { error } = await supabase.from('poll_options').insert([
-        {
-          poll_id: pollId,
-          type: 'time',
-          value: newTimeValue.trim(),
-        },
-      ]);
-      if (error) throw error;
-      setNewTimeValue('');
-      await fetchPollData();
-    } catch (err: any) {
-      console.error('Error adding time option:', err);
-      alert('Failed to add time option: ' + err.message);
-    } finally {
-      setAddingOption(false);
-    }
-  };
-
-  // Vote on an Option (Phase 2)
-  const handleVoteOnOption = async (optionId: string) => {
+  // Phase 2: Multi-option WhatsApp-style voting (toggle vote on option)
+  const handleToggleVoteOnOption = async (optionId: string) => {
     const trimmedName = voterName.trim();
     if (!trimmedName) {
-      alert('Please enter your name first in the header or attendance section.');
+      alert('Please enter your name first in the top bar to vote on options.');
       return;
     }
 
@@ -392,20 +370,25 @@ function PollContent({ params }: PollPageProps) {
         localStorage.setItem('turf_voter_name', trimmedName);
       }
 
+      // Check if user already voted on this specific option
       const existing = optionVotes.find(
         (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === trimmedName.toLowerCase()
       );
 
       if (existing) {
-        await supabase.from('option_votes').delete().eq('id', existing.id);
+        // Untick / remove vote
+        const { error } = await supabase.from('option_votes').delete().eq('id', existing.id);
+        if (error) throw error;
       } else {
-        await supabase.from('option_votes').insert([
+        // Tick / add vote
+        const { error } = await supabase.from('option_votes').insert([
           {
             option_id: optionId,
             poll_id: pollId,
             voter_name: trimmedName,
           },
         ]);
+        if (error) throw error;
       }
 
       await fetchPollData();
@@ -470,9 +453,7 @@ function PollContent({ params }: PollPageProps) {
     }
   };
 
-  // =========================================================================
   // Phase 3: Player Payment Screenshot Upload & Gemini API Verification
-  // =========================================================================
   const handleUploadPaymentScreenshot = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmedName = voterName.trim();
@@ -490,7 +471,6 @@ function PollContent({ params }: PollPageProps) {
     setPaymentUploadMsg(null);
 
     try {
-      // 1. Upload screenshot to Supabase 'screenshots' storage bucket
       const fileExt = paymentScreenshotFile.name.split('.').pop() || 'png';
       const cleanPlayerName = trimmedName.replace(/[^a-zA-Z0-9]/g, '_').toLowerCase();
       const fileName = `payment_${pollId}_${cleanPlayerName}_${Date.now()}.${fileExt}`;
@@ -506,14 +486,12 @@ function PollContent({ params }: PollPageProps) {
         throw new Error('Supabase Storage upload failed: ' + uploadError.message);
       }
 
-      // Get public URL of the uploaded screenshot
       const { data: publicUrlData } = supabase.storage
         .from('screenshots')
         .getPublicUrl(fileName);
 
       const screenshotPublicUrl = publicUrlData.publicUrl;
 
-      // 2. Call secure server-side Gemini verification API route
       const res = await fetch('/api/verify-payment', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -554,7 +532,6 @@ function PollContent({ params }: PollPageProps) {
         });
       }
 
-      // Reset file input
       setPaymentScreenshotFile(null);
       setPreviewUrl(null);
       await fetchPollData();
@@ -608,11 +585,10 @@ function PollContent({ params }: PollPageProps) {
   const comingList = votes.filter((v) => v.coming);
   const notComingList = votes.filter((v) => !v.coming);
 
-  // Group options by type
-  const dateOptions = options.filter((o) => o.type === 'date');
-  const timeOptions = options.filter((o) => o.type === 'time');
+  // Helper to extract option text whether stored in 'option_text' or 'value'
+  const getOptionLabel = (opt: PollOption) => opt.option_text || opt.value || 'Untitled Option';
 
-  // Count helpers
+  // Count helper
   const getVotesForOption = (optionId: string) => {
     return optionVotes.filter((ov) => ov.option_id === optionId);
   };
@@ -621,6 +597,13 @@ function PollContent({ params }: PollPageProps) {
       (ov) => ov.option_id === optionId && ov.voter_name.toLowerCase() === voterName.trim().toLowerCase()
     );
   };
+
+  // WhatsApp Poll stats calculation
+  const totalOptionVotesCount = optionVotes.length;
+  const maxVotesOnAnyOption = Math.max(
+    1,
+    ...options.map((opt) => getVotesForOption(opt.id).length)
+  );
 
   // Cost split calculation for finalised view
   const confirmedPlayersCount = comingList.length > 0 ? comingList.length : 1;
@@ -709,7 +692,7 @@ function PollContent({ params }: PollPageProps) {
           <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
             <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold tracking-wider uppercase border bg-emerald-500/10 border-emerald-500/30 text-emerald-400">
               {poll.status === 'poll_1' && 'Phase 1: Attendance'}
-              {poll.status === 'poll_2' && 'Phase 2: Date & Time Voting'}
+              {poll.status === 'poll_2' && 'Phase 2: WhatsApp-style Date & Time Poll'}
               {poll.status === 'finalised' && '🎉 Game Finalised & Booked'}
             </div>
             {poll.created_at && (
@@ -758,7 +741,7 @@ function PollContent({ params }: PollPageProps) {
         <div className="bg-zinc-900/60 border border-zinc-800/80 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm">
           <div className="flex items-center gap-2 text-zinc-300">
             <User className="w-4 h-4 text-emerald-400" />
-            <span>Viewing as Player:</span>
+            <span>Voting / Playing as:</span>
             <input
               type="text"
               value={voterName}
@@ -772,7 +755,7 @@ function PollContent({ params }: PollPageProps) {
               className="bg-zinc-950 border border-zinc-700 rounded-lg px-2.5 py-1 text-white text-xs outline-none focus:border-emerald-400 font-medium"
             />
           </div>
-          <span className="text-zinc-500 text-xs">Used for attendance, voting & payment verification</span>
+          <span className="text-zinc-500 text-xs">Tap any poll option to vote or unvote</span>
         </div>
 
         {/* ========================================================================= */}
@@ -790,7 +773,6 @@ function PollContent({ params }: PollPageProps) {
               </p>
             </div>
 
-            {/* Advance Phase Button (Host Only in poll_1) */}
             {isHost && poll.status === 'poll_1' && (
               <button
                 onClick={handleAdvanceToPoll2}
@@ -820,7 +802,7 @@ function PollContent({ params }: PollPageProps) {
             </div>
           )}
 
-          {/* Voting Action Buttons (Disabled in finalised) */}
+          {/* Attendance Action Buttons */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <button
               type="button"
@@ -896,170 +878,151 @@ function PollContent({ params }: PollPageProps) {
         </div>
 
         {/* ========================================================================= */}
-        {/* PHASE 2: Date & Time Voting */}
+        {/* PHASE 2: WhatsApp-Style Multi-Option Date & Time Poll */}
         {/* ========================================================================= */}
         {(poll.status === 'poll_2' || poll.status === 'finalised') && (
-          <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-8">
-            <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="bg-zinc-900/90 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-6">
+            <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
               <div>
-                <h2 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
-                  <Calendar className="w-5 h-5 text-emerald-400" />
-                  Date & Time Options
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 text-xs font-semibold uppercase tracking-wider mb-1 border border-emerald-500/20">
+                  <VoteIcon className="w-3.5 h-3.5" /> WhatsApp-Style Multi-Vote Poll
+                </div>
+                <h2 className="text-lg sm:text-2xl font-bold text-white flex items-center gap-2">
+                  Preferred Date & Time Options
                 </h2>
-                <p className="text-zinc-400 text-xs sm:text-sm mt-1">
-                  Suggest preferred match dates & time slots, then vote on your favorites.
+                <p className="text-zinc-400 text-xs sm:text-sm mt-0.5">
+                  Select multiple options that work for you. You can tap again to unvote anytime.
                 </p>
               </div>
+
               {poll.status === 'poll_2' && isHost && (
-                <div className="text-xs text-emerald-400 bg-emerald-950/50 border border-emerald-500/30 px-3 py-1.5 rounded-lg">
+                <div className="text-xs text-emerald-400 bg-emerald-950/60 border border-emerald-500/30 px-3 py-1.5 rounded-lg">
                   ⚡ As Host, pick the final winner below when ready!
                 </div>
               )}
             </div>
 
-            {/* Dates */}
-            <div className="space-y-4">
-              <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
-                <Calendar className="w-4 h-4" />
-                Date Options
-              </h3>
-
-              {poll.status !== 'finalised' && (
-                <form onSubmit={handleAddDateOption} className="flex gap-2">
+            {/* Combined Option Input Form */}
+            {poll.status !== 'finalised' && (
+              <form onSubmit={handleAddCombinedOption} className="space-y-2">
+                <label className="block text-xs font-semibold text-zinc-300">
+                  Add a Date & Time Option
+                </label>
+                <div className="flex gap-2">
                   <input
                     type="text"
-                    value={newDateValue}
-                    onChange={(e) => setNewDateValue(e.target.value)}
-                    placeholder='Suggest a date, e.g. "Sat, 15 Nov" or "Sun, 16 Nov"'
-                    className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-700 text-white placeholder-zinc-500 text-xs sm:text-sm outline-none focus:border-emerald-400"
+                    value={newCombinedOption}
+                    onChange={(e) => setNewCombinedOption(e.target.value)}
+                    placeholder='e.g. "Sat 15 Nov, 7:00 PM - 8:00 PM" or "Sun 16 Nov, 8:00 PM - 9:00 PM"'
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-950/90 border border-zinc-700 text-white placeholder-zinc-500 text-xs sm:text-sm outline-none focus:border-emerald-400 transition"
                   />
                   <button
                     type="submit"
-                    disabled={addingOption || !newDateValue.trim()}
-                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
+                    disabled={addingOption || !newCombinedOption.trim()}
+                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer shadow-md shadow-emerald-950/50"
                   >
                     <Plus className="w-4 h-4" />
-                    <span>Add</span>
+                    <span>Add Option</span>
                   </button>
-                </form>
-              )}
+                </div>
+              </form>
+            )}
 
-              {dateOptions.length === 0 ? (
-                <p className="text-zinc-600 text-xs italic">No date options proposed yet.</p>
+            {/* WhatsApp-Style Poll Options List */}
+            <div className="space-y-3 pt-2">
+              {options.length === 0 ? (
+                <div className="text-center py-8 rounded-xl bg-zinc-950/40 border border-dashed border-zinc-800 text-zinc-500 text-xs sm:text-sm">
+                  No date & time options added yet. Type an option above (e.g. &quot;Sat 15 Nov, 7:00 PM - 8:00 PM&quot;) and tap <strong>Add Option</strong>.
+                </div>
               ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  {dateOptions.map((opt) => {
-                    const optVoters = getVotesForOption(opt.id);
-                    const voted = hasUserVotedOption(opt.id);
-                    return (
+                options.map((opt) => {
+                  const optVoters = getVotesForOption(opt.id);
+                  const isVoted = hasUserVotedOption(opt.id);
+                  const label = getOptionLabel(opt);
+                  const votePercentage = Math.round((optVoters.length / maxVotesOnAnyOption) * 100);
+
+                  return (
+                    <div
+                      key={opt.id}
+                      onClick={() => {
+                        if (poll.status !== 'finalised') {
+                          handleToggleVoteOnOption(opt.id);
+                        }
+                      }}
+                      className={`relative overflow-hidden rounded-xl border p-4 transition-all duration-150 select-none ${
+                        poll.status !== 'finalised' ? 'cursor-pointer hover:border-emerald-500/60' : 'cursor-default'
+                      } ${
+                        isVoted
+                          ? 'bg-emerald-950/30 border-emerald-500/60 shadow-lg shadow-emerald-950/40'
+                          : 'bg-zinc-950/60 border-zinc-800/80 hover:bg-zinc-900/60'
+                      }`}
+                    >
+                      {/* WhatsApp-Style Progress Fill Background */}
                       <div
-                        key={opt.id}
-                        className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition ${
-                          voted
-                            ? 'bg-emerald-950/40 border-emerald-500/50'
-                            : 'bg-zinc-950/50 border-zinc-800'
+                        className={`absolute inset-y-0 left-0 transition-all duration-500 pointer-events-none ${
+                          isVoted ? 'bg-emerald-500/15' : 'bg-zinc-800/25'
                         }`}
-                      >
-                        <div>
-                          <div className="font-semibold text-sm text-zinc-100">{opt.value}</div>
-                          <div className="text-[11px] text-zinc-400 mt-0.5">
-                            {optVoters.length} vote{optVoters.length === 1 ? '' : 's'}
-                            {optVoters.length > 0 && ` (${optVoters.map((v) => v.voter_name).join(', ')})`}
+                        style={{ width: `${votePercentage}%` }}
+                      />
+
+                      <div className="relative z-10 flex items-start justify-between gap-3">
+                        <div className="flex items-start gap-3 flex-1 min-w-0">
+                          {/* WhatsApp-Style Circular Checkbox Indicator */}
+                          <div
+                            className={`w-5 h-5 mt-0.5 rounded-full border-2 flex items-center justify-center shrink-0 transition ${
+                              isVoted
+                                ? 'bg-emerald-500 border-emerald-500 text-zinc-950 shadow-sm'
+                                : 'border-zinc-600 bg-zinc-900/80'
+                            }`}
+                          >
+                            {isVoted && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                          </div>
+
+                          {/* Option Text and Voter Avatar Names */}
+                          <div className="space-y-1.5 flex-1 min-w-0">
+                            <div className={`text-sm sm:text-base font-semibold ${isVoted ? 'text-white' : 'text-zinc-200'}`}>
+                              {label}
+                            </div>
+
+                            {/* Voters list pill */}
+                            {optVoters.length > 0 ? (
+                              <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                                {optVoters.map((v) => (
+                                  <span
+                                    key={v.id || v.voter_name}
+                                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium ${
+                                      v.voter_name.toLowerCase() === voterName.trim().toLowerCase()
+                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                        : 'bg-zinc-800/80 text-zinc-400 border border-zinc-700/50'
+                                    }`}
+                                  >
+                                    <User className="w-2.5 h-2.5" />
+                                    {v.voter_name}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-zinc-500 italic">No votes yet</div>
+                            )}
                           </div>
                         </div>
 
-                        {poll.status !== 'finalised' && (
-                          <button
-                            type="button"
-                            onClick={() => handleVoteOnOption(opt.id)}
-                            disabled={optionActionId === opt.id}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 cursor-pointer transition ${
-                              voted
-                                ? 'bg-emerald-500 text-zinc-950'
-                                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
+                        {/* Vote count badge */}
+                        <div className="text-right shrink-0">
+                          <span
+                            className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-bold ${
+                              isVoted
+                                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                : 'bg-zinc-800 text-zinc-400'
                             }`}
                           >
-                            <ThumbsUp className="w-3 h-3" />
-                            {voted ? 'Voted' : 'Vote'}
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-
-            {/* Times */}
-            <div className="space-y-4 pt-4 border-t border-zinc-800">
-              <h3 className="text-sm font-semibold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
-                <Clock className="w-4 h-4" />
-                Time Slot Options
-              </h3>
-
-              {poll.status !== 'finalised' && (
-                <form onSubmit={handleAddTimeOption} className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newTimeValue}
-                    onChange={(e) => setNewTimeValue(e.target.value)}
-                    placeholder='Suggest a time slot, e.g. "7:00 PM - 8:00 PM"'
-                    className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-700 text-white placeholder-zinc-500 text-xs sm:text-sm outline-none focus:border-emerald-400"
-                  />
-                  <button
-                    type="submit"
-                    disabled={addingOption || !newTimeValue.trim()}
-                    className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs sm:text-sm flex items-center gap-1.5 transition disabled:opacity-50 cursor-pointer"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Add</span>
-                  </button>
-                </form>
-              )}
-
-              {timeOptions.length === 0 ? (
-                <p className="text-zinc-600 text-xs italic">No time slot options proposed yet.</p>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                  {timeOptions.map((opt) => {
-                    const optVoters = getVotesForOption(opt.id);
-                    const voted = hasUserVotedOption(opt.id);
-                    return (
-                      <div
-                        key={opt.id}
-                        className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition ${
-                          voted
-                            ? 'bg-emerald-950/40 border-emerald-500/50'
-                            : 'bg-zinc-950/50 border-zinc-800'
-                        }`}
-                      >
-                        <div>
-                          <div className="font-semibold text-sm text-zinc-100">{opt.value}</div>
-                          <div className="text-[11px] text-zinc-400 mt-0.5">
-                            {optVoters.length} vote{optVoters.length === 1 ? '' : 's'}
-                            {optVoters.length > 0 && ` (${optVoters.map((v) => v.voter_name).join(', ')})`}
-                          </div>
+                            {optVoters.length} {optVoters.length === 1 ? 'vote' : 'votes'}
+                          </span>
                         </div>
-
-                        {poll.status !== 'finalised' && (
-                          <button
-                            type="button"
-                            onClick={() => handleVoteOnOption(opt.id)}
-                            disabled={optionActionId === opt.id}
-                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 cursor-pointer transition ${
-                              voted
-                                ? 'bg-emerald-500 text-zinc-950'
-                                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300'
-                            }`}
-                          >
-                            <ThumbsUp className="w-3 h-3" />
-                            {voted ? 'Voted' : 'Vote'}
-                          </button>
-                        )}
                       </div>
-                    );
-                  })}
-                </div>
+                    </div>
+                  );
+                })
               )}
             </div>
           </div>
@@ -1123,6 +1086,44 @@ function PollContent({ params }: PollPageProps) {
             )}
 
             <form onSubmit={handleFinalisePoll} className="space-y-4">
+              {/* Quick Select from Voted Options */}
+              {options.length > 0 && (
+                <div className="p-3.5 rounded-xl bg-zinc-950/70 border border-zinc-800">
+                  <span className="text-xs font-semibold text-zinc-300 block mb-2">
+                    Quick-Fill from Leading Poll Options:
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {options.map((o) => {
+                      const vCount = getVotesForOption(o.id).length;
+                      const label = getOptionLabel(o);
+                      return (
+                        <button
+                          key={o.id}
+                          type="button"
+                          onClick={() => {
+                            // Split on comma or hyphen if present
+                            if (label.includes(',')) {
+                              const [d, ...t] = label.split(',');
+                              setFinalDate(d.trim());
+                              setFinalTime(t.join(',').trim());
+                            } else {
+                              setFinalDate(label);
+                            }
+                          }}
+                          className="text-xs px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-emerald-600 hover:text-zinc-950 text-zinc-200 border border-zinc-700 transition flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <VoteIcon className="w-3 h-3 text-emerald-400" />
+                          <span>{label}</span>
+                          <span className="text-[10px] bg-zinc-900 px-1.5 py-0.5 rounded text-emerald-400 font-bold">
+                            {vCount}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
                   <label htmlFor="finalDate" className="block text-xs font-semibold text-zinc-300 mb-1.5 flex items-center gap-1.5">
@@ -1138,21 +1139,6 @@ function PollContent({ params }: PollPageProps) {
                     required
                     className="w-full px-3.5 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-700 focus:border-emerald-400 text-white text-xs sm:text-sm outline-none"
                   />
-                  {dateOptions.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1.5">
-                      <span className="text-[10px] text-zinc-500">Suggested:</span>
-                      {dateOptions.map((o) => (
-                        <button
-                          key={o.id}
-                          type="button"
-                          onClick={() => setFinalDate(o.value)}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
-                        >
-                          {o.value}
-                        </button>
-                      ))}
-                    </div>
-                  )}
                 </div>
 
                 <div>
@@ -1165,25 +1151,10 @@ function PollContent({ params }: PollPageProps) {
                     type="text"
                     value={finalTime}
                     onChange={(e) => setFinalTime(e.target.value)}
-                    placeholder="e.g. 8:00 PM - 9:00 PM"
+                    placeholder="e.g. 7:00 PM - 8:00 PM"
                     required
                     className="w-full px-3.5 py-2.5 rounded-xl bg-zinc-950/80 border border-zinc-700 focus:border-emerald-400 text-white text-xs sm:text-sm outline-none"
                   />
-                  {timeOptions.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1.5">
-                      <span className="text-[10px] text-zinc-500">Suggested:</span>
-                      {timeOptions.map((o) => (
-                        <button
-                          key={o.id}
-                          type="button"
-                          onClick={() => setFinalTime(o.value)}
-                          className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300"
-                        >
-                          {o.value}
-                        </button>
-                      ))}
-                    </div>
-                  )}
                 </div>
               </div>
 
@@ -1270,7 +1241,6 @@ function PollContent({ params }: PollPageProps) {
         {/* ========================================================================= */}
         {poll.status === 'finalised' && (
           <div className="space-y-6">
-            {/* Split & Venue Summary */}
             <div className="bg-gradient-to-br from-emerald-950/80 via-zinc-900 to-zinc-950 border border-emerald-500/50 rounded-2xl p-6 sm:p-8 shadow-2xl space-y-6">
               <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
                 <div>
@@ -1359,7 +1329,7 @@ function PollContent({ params }: PollPageProps) {
               </div>
             </div>
 
-            {/* PLAYER PAYMENT & SCREENSHOT UPLOAD COMPONENT (FEATURE 3) */}
+            {/* PLAYER PAYMENT & SCREENSHOT UPLOAD COMPONENT */}
             <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-6">
               <div className="flex items-center justify-between flex-wrap gap-2">
                 <div>
@@ -1499,9 +1469,7 @@ function PollContent({ params }: PollPageProps) {
               </form>
             </div>
 
-            {/* ========================================================================= */}
-            {/* HOST MANAGEMENT DASHBOARD TABLE (FEATURE 3) */}
-            {/* ========================================================================= */}
+            {/* HOST MANAGEMENT DASHBOARD TABLE */}
             {isHost && (
               <div className="bg-zinc-900/80 backdrop-blur-md border border-zinc-800 rounded-2xl p-6 sm:p-8 shadow-xl space-y-6">
                 <div className="flex items-center justify-between flex-wrap gap-2 border-b border-zinc-800 pb-4">
@@ -1536,7 +1504,6 @@ function PollContent({ params }: PollPageProps) {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-zinc-800/60">
-                      {/* Combine all confirmed players and any player who submitted payment */}
                       {Array.from(
                         new Set([...comingList.map((v) => v.voter_name), ...payments.map((p) => p.player_name)])
                       ).map((playerName) => {
@@ -1549,7 +1516,6 @@ function PollContent({ params }: PollPageProps) {
 
                         return (
                           <tr key={playerName} className="hover:bg-zinc-800/30 transition">
-                            {/* Player Name */}
                             <td className="py-3.5 px-3 font-semibold text-white">
                               {playerName}
                               {poll.host_name.toLowerCase() === playerName.toLowerCase() && (
@@ -1559,7 +1525,6 @@ function PollContent({ params }: PollPageProps) {
                               )}
                             </td>
 
-                            {/* Attendance */}
                             <td className="py-3.5 px-3">
                               {playerVote?.coming ? (
                                 <span className="inline-flex items-center gap-1 text-emerald-400 text-xs">
@@ -1574,7 +1539,6 @@ function PollContent({ params }: PollPageProps) {
                               )}
                             </td>
 
-                            {/* Gemini AI Verdict */}
                             <td className="py-3.5 px-3">
                               {playerPayment ? (
                                 <div className="space-y-1">
@@ -1610,7 +1574,6 @@ function PollContent({ params }: PollPageProps) {
                               )}
                             </td>
 
-                            {/* Amount & Txn ID */}
                             <td className="py-3.5 px-3">
                               {playerPayment ? (
                                 <div>
@@ -1626,7 +1589,6 @@ function PollContent({ params }: PollPageProps) {
                               )}
                             </td>
 
-                            {/* Screenshot Link */}
                             <td className="py-3.5 px-3">
                               {playerPayment?.screenshot_url ? (
                                 <a
@@ -1643,7 +1605,6 @@ function PollContent({ params }: PollPageProps) {
                               )}
                             </td>
 
-                            {/* Host Manual Override Actions */}
                             <td className="py-3.5 px-3 text-right">
                               {playerPayment ? (
                                 <div className="inline-flex items-center gap-1.5">

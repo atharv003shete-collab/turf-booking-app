@@ -1,4 +1,4 @@
--- SQL Schema for Turf Booking App (Phase 1 + Phase 2 + Phase 3)
+-- SQL Schema for Turf Booking App (Phase 1 + Phase 2 WhatsApp Poll + Phase 3)
 
 -- 1. Create polls table
 CREATE TABLE IF NOT EXISTS public.polls (
@@ -27,17 +27,30 @@ CREATE TABLE IF NOT EXISTS public.votes (
     CONSTRAINT votes_poll_id_voter_name_key UNIQUE (poll_id, voter_name)
 );
 
--- 3. Create poll_options table (Phase 2 Date & Time options)
+-- 3. Create poll_options table (Phase 2 WhatsApp-style Combined Date & Time Options)
+-- Supports both 'option_text' and 'value' for seamless backwards compatibility
 CREATE TABLE IF NOT EXISTS public.poll_options (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     poll_id UUID NOT NULL REFERENCES public.polls(id) ON DELETE CASCADE,
-    type TEXT NOT NULL, -- 'date' or 'time'
-    value TEXT NOT NULL, -- e.g. "Sat, 15 Nov" or "7:00 PM - 8:00 PM"
+    option_text TEXT, -- e.g. "Sat 15 Nov, 7:00 PM - 8:00 PM"
+    value TEXT,       -- backwards compatibility alias
+    type TEXT DEFAULT 'combined',
     votes_count INT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
 
--- 4. Create option_votes table (Phase 2 votes on options)
+-- Add column if table already exists without option_text
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='poll_options' AND column_name='option_text') THEN
+        ALTER TABLE public.poll_options ADD COLUMN option_text TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='poll_options' AND column_name='value') THEN
+        ALTER TABLE public.poll_options ADD COLUMN value TEXT;
+    END IF;
+END $$;
+
+-- 4. Create option_votes table (Phase 2 votes on options - multiple selections supported)
 CREATE TABLE IF NOT EXISTS public.option_votes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     option_id UUID NOT NULL REFERENCES public.poll_options(id) ON DELETE CASCADE,
@@ -106,8 +119,3 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.votes;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.poll_options;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.option_votes;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.payments;
-
--- 9. Storage bucket for screenshots
--- INSERT INTO storage.buckets (id, name, public) VALUES ('screenshots', 'screenshots', true) ON CONFLICT DO NOTHING;
--- CREATE POLICY "Allow public uploads to screenshots bucket" ON storage.objects FOR INSERT WITH CHECK (bucket_id = 'screenshots');
--- CREATE POLICY "Allow public view to screenshots bucket" ON storage.objects FOR SELECT USING (bucket_id = 'screenshots');
